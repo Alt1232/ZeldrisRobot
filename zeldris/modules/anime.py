@@ -1,527 +1,758 @@
-#  ZeldrisRobot
-#  Copyright (C) 2017-2019, Paul Larsen
-#  Copyright (C) 2022, IDNCoderX Team, <https://github.com/IDN-C-X/ZeldrisRobot>
-#
-#  This program is free software: you can redistribute it and/or modify
-#  it under the terms of the GNU Affero General Public License as published by
-#  the Free Software Foundation, either version 3 of the License, or
-#  (at your option) any later version.
-#
-#  This program is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-#  GNU Affero General Public License for more details.
-#
-#  You should have received a copy of the GNU Affero General Public License
-#  along with this program. If not, see <http://www.gnu.org/licenses/>.
+# base code was taken from @DeletedUser420's Userge-Plugins repo
+# originally authored by Phyco-Ninja (https://github.com/Phyco-Ninja) (@PhycoNinja13b)
+# I've just tweaked his file a bit (maybe a lot)
+# But i sticked to the format he used which looked cool
+
+""" Search for Anime related Info using Anilist API """
 
 
-import contextlib
-import datetime
-import textwrap
-
-import jikanpy
-import requests
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ParseMode,
-    Update,
-    Message,
+import asyncio, requests, time, random, re
+from pyrogram import filters, Client
+from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message
+from pyrogram.errors import UserNotParticipant
+from .. import ANILIST_CLIENT, ANILIST_REDIRECT_URL, ANILIST_SECRET, HELP_DICT, OWNER, TRIGGERS as trg, BOT_NAME
+from ..utils.data_parser import (
+    get_all_genres, get_all_tags, get_top_animes, get_user_activity, get_user_favourites, toggle_favourites,
+    get_anime, get_airing, get_anilist, get_character, get_additional_info, get_manga,
+    get_featured_in_lists, update_anilist, get_user, ANIME_DB, MANGA_DB
 )
-from telegram.ext import CallbackContext
+from ..utils.helper import check_user, get_btns, AUTH_USERS, rand_key, clog
+from ..utils.db import get_collection
 
-from zeldris import dispatcher
-from zeldris.modules.disable import DisableAbleCommandHandler
+GROUPS = get_collection("GROUPS")
+SFW_GRPS = get_collection("SFW_GROUPS")
+DC = get_collection('DISABLED_CMDS')
+AG = get_collection('AIRING_GROUPS')
 
-info_btn = "More Information"
-prequel_btn = "⬅️ Prequel"
-sequel_btn = "Sequel ➡️"
-close_btn = "Close ❌"
+no_pic = [
+    'https://telegra.ph/file/0d2097f442e816ba3f946.jpg',
+    'https://telegra.ph/file/5a152016056308ef63226.jpg',
+    'https://telegra.ph/file/d2bf913b18688c59828e9.jpg',
+    'https://telegra.ph/file/d53083ea69e84e3b54735.jpg',
+    'https://telegra.ph/file/b5eb1e3606b7d2f1b491f.jpg'
+]
 
 
-def shorten(description, info="anilist.co"):
-    msg = ""
-    if len(description) > 700:
-        description = f"{description[:500]}...."
-        msg += f"\n*Description*: _{description}_[Read More]({info})"
+@Client.on_message(filters.command(["anime", f"anime{BOT_NAME}"], prefixes=trg))
+async def anime_cmd(client: Client, message: Message):
+    """Search Anime Info"""
+    text = message.text.split(" ", 1)
+    gid = message.chat
+    if gid.type in ["supergroup", "group"] and not await (GROUPS.find_one({"id": gid.id})):
+        await GROUPS.insert_one({"id": gid.id, "grp": gid.title})
+        await clog("ANIBOT", f"Bot added to a new group\n\n{gid.username or gid.title}\nID: `{gid.id}`", "NEW_GROUP")
+    find_gc = await DC.find_one({'_id': message.chat.id})
+    if find_gc!=None and 'anime' in find_gc['cmd_list'].split():
+        return
+    if len(text)==1:
+        k = await message.reply_text("Please give a query to search about\nexample: /anime Ao Haru Ride")
+        await asyncio.sleep(5)
+        return await k.delete()
+    query = text[1]
+    auth = False
+    vars_ = {"search": query}
+    if query.isdigit():
+        vars_ = {"id": int(query)}
+    user = message.from_user.id
+    if (await AUTH_USERS.find_one({"id": user})):
+        auth = True
+    result = await get_anime(vars_, user=user, auth=auth)
+    if len(result) != 1:
+        title_img, finals_ = result[0], result[1]
     else:
-        msg += f"\n*Description*:_{description}_"
-    return msg
+        k = await message.reply_text(result[0])
+        await asyncio.sleep(5)
+        return await k.delete()
+    buttons = get_btns("ANIME", result=result, user=user, auth=auth)
+    if await (SFW_GRPS.find_one({"id": gid.id})) and result[2].pop()=="True":
+        await client.send_photo(message.chat.id, no_pic[random.randint(0, 4)], caption="This anime is marked 18+ and not allowed in this group")
+        return
+    await client.send_photo(message.chat.id, title_img, caption=finals_, reply_markup=buttons)
 
 
-# time formatter from uniborg
-def t(milliseconds: int) -> str:
-    """Inputs time in milliseconds, to get beautified time,
-    as string"""
-    seconds, milliseconds = divmod(milliseconds, 1000)
-    minutes, seconds = divmod(seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-    days, hours = divmod(hours, 24)
-    tmp = (
-        (f"{str(days)} Days, " if days else "")
-        + (f"{str(hours)} Hours, " if hours else "")
-        + (f"{str(minutes)} Minutes, " if minutes else "")
-        + (f"{str(seconds)} Seconds, " if seconds else "")
-        + (f"{str(milliseconds)} ms, " if milliseconds else "")
+@Client.on_message(filters.command(["manga", f"manga{BOT_NAME}"], prefixes=trg))
+async def manga_cmd(client: Client, message: Message):
+    """Search Manga Info"""
+    text = message.text.split(" ", 1)
+    gid = message.chat
+    if gid.type in ["supergroup", "group"] and not await (GROUPS.find_one({"id": gid.id})):
+        await GROUPS.insert_one({"id": gid.id, "grp": gid.title})
+        await clog("ANIBOT", f"Bot added to a new group\n\n{gid.username or gid.title}\nID: `{gid.id}`", "NEW_GROUP")
+    find_gc = await DC.find_one({'_id': message.chat.id})
+    if find_gc!=None and 'manga' in find_gc['cmd_list'].split():
+        return
+    if len(text)==1:
+        k = await message.reply_text("Please give a query to search about\nexample: /manga The teasing master Takagi san")
+        await asyncio.sleep(5)
+        return await k.delete()
+    query = text[1]
+    qdb = rand_key()
+    MANGA_DB[qdb] = query
+    auth = False
+    user = message.from_user.id
+    if (await AUTH_USERS.find_one({"id": user})):
+        auth = True
+    result = await get_manga(qdb, 1, auth=auth, user=user)
+    if len(result) == 1:
+        k = await message.reply_text(result[0])
+        await asyncio.sleep(5)
+        return await k.delete()
+    pic, finals_ = result[0], result[1][0]
+    buttons = get_btns("MANGA", lsqry=qdb, lspage=1, user=user, result=result, auth=auth)
+    if await (SFW_GRPS.find_one({"id": message.chat.id})) and result[2].pop()=="True":
+        buttons = get_btns("MANGA", lsqry=qdb, lspage=1, user=user, result=result, auth=auth, sfw="True")
+        await client.send_photo(message.chat.id, no_pic[random.randint(0, 4)], caption="This manga is marked 18+ and not allowed in this group", reply_markup=buttons)
+        return
+    await client.send_photo(message.chat.id, pic, caption=finals_, reply_markup=buttons)
+
+
+@Client.on_message(filters.command(["character", f"character{BOT_NAME}"], prefixes=trg))
+async def character_cmd(client: Client, message: Message):
+    """Get Info about a Character"""
+    text = message.text.split(" ", 1)
+    gid = message.chat
+    if gid.type in ["supergroup", "group"] and not await (GROUPS.find_one({"id": gid.id})):
+        await GROUPS.insert_one({"id": gid.id, "grp": gid.title})
+        await clog("ANIBOT", f"Bot added to a new group\n\n{gid.username or gid.title}\nID: `{gid.id}`", "NEW_GROUP")
+    find_gc = await DC.find_one({'_id': message.chat.id})
+    if find_gc!=None and 'character' in find_gc['cmd_list'].split():
+        return
+    if len(text)==1:
+        k = await message.reply_text("Please give a query to search about\nexample: /character Nezuko")
+        await asyncio.sleep(5)
+        return await k.delete()
+    query = text[1]
+    var = {"search": query}
+    auth = False
+    user = message.from_user.id
+    if (await AUTH_USERS.find_one({"id": user})):
+        auth = True
+    result = await get_character(var, auth=auth, user=user)
+    if len(result) == 1:
+        k = await message.reply_text(result[0])
+        await asyncio.sleep(5)
+        return await k.delete()
+    img = result[0]
+    cap_text = result[1][0]
+    buttons = get_btns("CHARACTER", user=user, lsqry=query, lspage=1, result=result, auth=auth)
+    await client.send_photo(message.chat.id, img, caption=cap_text, reply_markup=buttons)
+
+
+@Client.on_message(filters.command(["anilist", f"anilist{BOT_NAME}"], prefixes=trg))
+async def anilist_cmd(client: Client, message: Message):
+    text = message.text.split(" ", 1)
+    find_gc = await DC.find_one({'_id': message.chat.id})
+    if find_gc!=None and 'anilist' in find_gc['cmd_list'].split():
+        return
+    if len(text)==1:
+        k = await message.reply_text("Please give a query to search about\nexample: /anilist rezero")
+        await asyncio.sleep(5)
+        return await k.delete()
+    query = text[1]
+    qdb = rand_key()
+    ANIME_DB[qdb] = query
+    auth = False
+    user = message.from_user.id
+    if (await AUTH_USERS.find_one({"id": user})):
+        auth = True
+    result = await get_anilist(qdb, 1, auth=auth, user=user)
+    if len(result) == 1:
+        k = await message.reply_text(result[0])
+        await asyncio.sleep(5)
+        return await k.delete()
+    pic, msg = result[0], result[1][0]
+    buttons = get_btns("ANIME", lsqry=qdb, lspage=1, result=result, user=user, auth=auth)
+    if await (SFW_GRPS.find_one({"id": message.chat.id})) and result[2].pop()=="True":
+        buttons = get_btns("ANIME", lsqry=qdb, lspage=1, result=result, user=user, auth=auth, sfw="True")
+        await client.send_photo(message.chat.id, no_pic[random.randint(0, 4)], caption="This anime is marked 18+ and not allowed in this group", reply_markup=buttons)
+        return
+    await client.send_photo(message.chat.id, pic, caption=msg, reply_markup=buttons)
+
+
+@Client.on_message(filters.command(["flex", f"flex{BOT_NAME}", "user", f"user{BOT_NAME}"], prefixes=trg))
+async def flex_cmd(client: Client, message: Message):
+    query = message.text.split(" ", 1)
+    qry = None
+    find_gc = await DC.find_one({'_id': message.chat.id})
+    if "user" in query[0]:
+        if find_gc!=None and 'user' in find_gc['cmd_list'].split():
+            return
+        if not len(query)==2:
+            k = await message.reply_text("Please give an anilist username to search about\nexample: /user Lostb053")
+            await asyncio.sleep(5)
+            return await k.delete()
+        else:
+            qry = {"search": query[1]}
+    if find_gc!=None and 'flex' in find_gc['cmd_list'].split():
+        return
+    user = message.from_user.id
+    if not "user" in query[0] and not (await AUTH_USERS.find_one({"id": user})):
+        bot_us = (await client.get_me()).username
+        return await message.reply_text(
+            "Please connect your account first to use this cmd",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Auth", url=f"https://t.me/{bot_us}/?start=auth")]])
+        )
+    result = await get_user(qry, query[0], user)
+    if len(result) == 1:
+        k = await message.reply_text(result[0])
+        await asyncio.sleep(5)
+        return await k.delete()
+    pic, msg, buttons = result
+    await client.send_photo(message.chat.id, pic, caption=msg, reply_markup=buttons)
+
+
+@Client.on_message(filters.command(["top", f"top{BOT_NAME}"], prefixes=trg))
+async def top_tags_cmd(client: Client, message: Message):
+    query = message.text.split(" ", 1)
+    find_gc = await DC.find_one({'_id': message.chat.id})
+    if find_gc!=None and 'top' in find_gc['cmd_list'].split():
+        return
+    get_tag = "None"
+    if len(query)==2:
+        get_tag = query[1]
+    user = message.from_user.id
+    result = await get_top_animes(get_tag, 1, user)
+    if len(result) == 1:
+        k = await message.reply_text(result[0])
+        await asyncio.sleep(5)
+        return await k.delete()
+    if await (SFW_GRPS.find_one({"id": message.chat.id})) and str(result[0][1])=="True":
+        return await message.reply_text('No nsfw stuff allowed in this group!!!')
+    msg, buttons = result
+    await client.send_message(message.chat.id, msg[0], reply_markup=buttons if buttons!='' else None)
+
+
+@Client.on_message(filters.command(["airing", f"airing{BOT_NAME}"], prefixes=trg))
+async def airing_cmd(client: Client, message: Message):
+    """Get Airing Detail of Anime"""
+    text = message.text.split(" ", 1)
+    find_gc = await DC.find_one({'_id': message.chat.id})
+    if find_gc!=None and 'airing' in find_gc['cmd_list'].split():
+        return
+    if len(text)==1:
+        k = await message.reply_text("Please give a query to search about\nexample: /airing Fumetsu no Anata e")
+        await asyncio.sleep(5)
+        return await k.delete()
+    query = text[1]
+    vars_ = {"search": query}
+    if query.isdigit():
+        vars_ = {"id": int(query), "asHtml": True}
+    auth = False
+    user = message.from_user.id
+    if (await AUTH_USERS.find_one({"id": user})):
+        auth = True
+    result = await get_airing(vars_, auth=auth, user=user)
+    if len(result) == 1:
+        k = await message.reply_text(result[0])
+        await asyncio.sleep(5)
+        return await k.delete()
+    coverImg, out = result[0]
+    btn = get_btns("AIRING", user=user, result=result, auth=auth)
+    if await (SFW_GRPS.find_one({"id": message.chat.id})) and result[2].pop()=="True":
+        await client.send_photo(message.chat.id, no_pic[random.randint(0, 4)], caption="This anime is marked 18+ and not allowed in this group")
+        return
+    await client.send_photo(message.chat.id, coverImg, caption=out, reply_markup=btn)
+
+
+@Client.on_message(filters.private & filters.command("auth", prefixes=trg))
+async def auth_link_cmd(client, message: Message):
+    await message.reply_text(
+        text = """Follow the steps to complete Authorization:
+1. Click the below button
+2. Authorize the app and copy the authorization code
+3. Send the code along with cmd /code like '/code <u>auth code from website</u>'""",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+            text="Authorize",
+            url=f"https://anilist.co/api/v2/oauth/authorize?client_id={ANILIST_CLIENT}&redirect_uri={ANILIST_REDIRECT_URL}&response_type=code"
+        )]])
     )
 
-    return tmp[:-2]
 
-
-airing_query = """
-query ($id: Int,$search: String) {
-    Media (id: $id, type: ANIME,search: $search) {
-        id
-        episodes
-        title {
-            romaji
-            english
-            native
-        }
-        nextAiringEpisode {
-            airingAt
-            timeUntilAiring
-            episode
-        }
-    }
-}
-"""
-
-fav_query = """
-query ($id: Int) {
-    Media (id: $id, type: ANIME) {
-        id
-        title {
-            romaji
-            english
-            native
-        }
-    }
-}
-"""
-
-anime_query = """
-query ($id: Int,$search: String) {
-    Media (id: $id, type: ANIME,search: $search) {
-        id
-        title {
-            romaji
-            english
-            native
-        }
-        description (asHtml: false)
-        startDate{
-            year
-        }
-        episodes
-        season
-        type
-        format
-        status
-        duration
-        siteUrl
-        studios{
-            nodes{
-                name
-            }
-        }
-        trailer{
-            id
-            site
-            thumbnail
-        }
-        averageScore
-        genres
-        bannerImage
-    }
-}
-"""
-
-character_query = """
-query ($query: String) {
-    Character (search: $query) {
-        id
-        name {
-            first
-            last
-            full
-        }
-        siteUrl
-        image {
-            large
-        }
-        description
-    }
-}
-"""
-
-manga_query = """
-query ($id: Int,$search: String) {
-    Media (id: $id, type: MANGA,search: $search) {
-        id
-        title {
-            romaji
-            english
-            native
-        }
-        description (asHtml: false)
-        startDate{
-            year
-        }
-        type
-        format
-        status
-        siteUrl
-        averageScore
-        genres
-        bannerImage
-    }
-}
-"""
-
-url = "https://graphql.anilist.co"
-
-
-def extract_arg(message: Message):
-    split = message.text.split(" ", 1)
-    if len(split) > 1:
-        return split[1]
-    reply = message.reply_to_message
-    if reply is not None:
-        return reply.text
-    return None
-
-
-def airing(update: Update, _: CallbackContext):
-    message = update.effective_message
-    search_str = extract_arg(message)
-    if not search_str:
-        update.effective_message.reply_text(
-            "Tell Anime Name :) ( /airing <anime name>)",
+@Client.on_message(~filters.private & filters.command(["settings", f"settings{BOT_NAME}"], prefixes=trg))
+async def sfw_cmd(client: Client, message: Message):
+    if message.from_user.id in OWNER or (await client.get_chat_member(message.chat.id, message.from_user.id)).status!='member':
+        text = "This allows you to change group settings\n\nNSFW toggle switches on filtering of 18+ marked content\nAiring notifications notifies about airing of anime in recent"
+        sfw = "NSFW: Allowed"
+        if await (SFW_GRPS.find_one({"id": message.chat.id})):
+            sfw = "NSFW: Not Allowed"
+        notif = "Airing notifications: OFF"
+        if await (AG.find_one({"_id": message.chat.id})):
+            notif = "Airing notifications: ON"
+        await message.reply_text(
+            text = text,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(text=sfw, callback_data=f"settogl_sfw_{message.chat.id}")],
+                [InlineKeyboardButton(text=notif, callback_data=f"settogl_notif_{message.chat.id}")]
+            ])
         )
-        return
-    variables = {"search": search_str}
-    response = requests.post(
-        url,
-        json={"query": airing_query, "variables": variables},
-    ).json()["data"]["Media"]
-    msg = f"*Name*: *{response['title']['romaji']}*(`{response['title']['native']}`)\n*ID*: `{response['id']}`"
-    if response["nextAiringEpisode"]:
-        time = response["nextAiringEpisode"]["timeUntilAiring"] * 1000
-        time = t(time)
-        msg += f"\n*Episode*: `{response['nextAiringEpisode']['episode']}`\n*Airing In*: `{time}`"
+
+
+@Client.on_message(filters.private & filters.command("code", prefixes=trg))
+async def code_cmd(client, message: Message):
+    text = message.text.split(" ", 1)
+    if len(text)==1:
+        k = await message.reply_text("Needs code!!!")
+        await asyncio.sleep(5)
+        return await k.delete()
+    query = text[1]
+    headers = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+    }
+    json = {
+        'grant_type': 'authorization_code',
+        'client_id': ANILIST_CLIENT,
+        'client_secret': ANILIST_SECRET,
+        'redirect_uri': ANILIST_REDIRECT_URL,
+        'code': query
+    }
+    if (await AUTH_USERS.find_one({"id": message.from_user.id})):
+        return await message.reply_text("You have already yourself\nIf you wish to logout send /logout")
+    response: dict = requests.post("https://anilist.co/api/v2/oauth/token", headers=headers, json=json).json()
+    if response.get("access_token"):
+        await AUTH_USERS.insert_one({"id": message.from_user.id, "token": response.get("access_token")})
+        await message.reply_text("Authorization Successfull!!!" )
     else:
-        msg += f"\n*Episode*:{response['episodes']}\n*Status*: `N/A`"
-    message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+        await message.reply_text("Please verify code, or get new one from website!!!")
 
 
-def anime(update: Update, _: CallbackContext):  # sourcery skip: low-code-quality
-    message = update.effective_message
-    search = extract_arg(message)
-    if not search:
-        message.reply_text("Format : /anime < anime name >")
+@Client.on_message(filters.command(["me", f"me{BOT_NAME}", "activity", f"activity{BOT_NAME}"], prefixes=trg))
+async def activity_cmd(client: Client, message: Message):
+    user = message.from_user.id
+    find_gc = await DC.find_one({'_id': message.chat.id})
+    if find_gc!=None and ('me' or 'activity') in find_gc['cmd_list'].split():
         return
+    if not (await AUTH_USERS.find_one({"id": user})):
+        bot_us = (await client.get_me()).username
+        return await message.reply_text(
+            "Please connect your account first to use this cmd",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Auth", url=f"https://t.me/{bot_us}/?start=auth")]])
+        )
+    result = await get_user(None, "flex", user)
+    query = result[0].split("/").pop().split("?")[0]
+    result = await get_user_activity(int(query), user=int(user))
+    pic, msg, kek = result
+    btns = InlineKeyboardMarkup([[InlineKeyboardButton("Profile", url=f"https://anilist.co/user/{query}")]])
+    await client.send_photo(message.chat.id, pic, caption=msg, reply_markup=btns)
 
-    variables = {"search": search}
-    json = requests.post(
-        url,
-        json={"query": anime_query, "variables": variables},
-    ).json()
-    if "errors" in json.keys():
-        message.reply_text("Anime not found")
+
+@Client.on_message(filters.command(["favourites", f"favourites{BOT_NAME}"], prefixes=trg))
+async def favourites_cmd(client: Client, message: Message):
+    user = message.from_user.id
+    find_gc = await DC.find_one({'_id': message.chat.id})
+    if find_gc!=None and 'favourites' in find_gc['cmd_list'].split():
         return
-
-    if json:
-        json = json["data"]["Media"]
-        msg = (
-            f"*{json['title']['romaji']}*(`{json['title']['native']}`)\n"
-            f"*Type*: {json['format']}\n*Status*: {json['status']}\n"
-            f"*Episodes*: {json.get('episodes', 'N/A')}\n"
-            f"*Duration*: {json.get('duration', 'N/A')} Per Ep.\n"
-            f"*Score*: {json['averageScore']}\n"
-            f"*Genres*: `"
+    if not (await AUTH_USERS.find_one({"id": user})):
+        bot_us = (await client.get_me()).username
+        return await message.reply_text(
+            "Please connect your account first to use this cmd",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Auth", url=f"https://t.me/{bot_us}/?start=auth")]])
         )
-        for x in json["genres"]:
-            msg += f"{x}, "
-        msg = msg[:-2] + "`\n"
-        msg += "*Studios*: `"
-        for x in json["studios"]["nodes"]:
-            msg += f"{x['name']}, "
-        msg = msg[:-2] + "`\n"
-        info = json.get("siteUrl")
-        trailer = json.get("trailer", None)
-        if trailer:
-            trailer_id = trailer.get("id", None)
-            site = trailer.get("site", None)
-            if site == "youtube":
-                trailer = f"https://youtu.be/{trailer_id}"
-        description = (
-            json.get("description", "N/A")
-            .replace("<i>", "")
-            .replace("</i>", "")
-            .replace("<br>", "")
-        )
-        msg += shorten(description, info)
-        image = json.get("bannerImage", None)
-        if trailer:
-            buttons = [
-                [
-                    InlineKeyboardButton("More Info", url=info),
-                    InlineKeyboardButton("Trailer 🎬", url=trailer),
-                ],
+    q = message.from_user.id
+    result = await get_user(None, "flex", user)
+    query = result[0].split("/").pop().split("?")[0]
+    btn = InlineKeyboardMarkup(
+        [   
+            [
+                InlineKeyboardButton("ANIME", callback_data=f"myfavqry_ANIME_{query}_1_no_{q}"),
+                InlineKeyboardButton("CHARACTER", callback_data=f"myfavqry_CHAR_{query}_1_no_{q}"),
+                InlineKeyboardButton("MANGA", callback_data=f"myfavqry_MANGA_{query}_1_no_{q}")
+            ],
+            [
+                InlineKeyboardButton("Profile", url=f"https://anilist.co/user/{query}")
             ]
-        else:
-            buttons = [[InlineKeyboardButton("More Info", url=info)]]
-        if image:
-            try:
-                message.reply_photo(
-                    photo=image,
-                    caption=msg,
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=InlineKeyboardMarkup(buttons),
-                )
-            except BaseException:
-                msg += f" [〽️]({image})"
-                message.reply_text(
-                    msg,
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=InlineKeyboardMarkup(buttons),
-                )
-        else:
-            message.reply_text(
-                msg,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=InlineKeyboardMarkup(buttons),
-            )
+        ]
+    )
+    await client.send_photo(message.chat.id, result[0], caption="Choose one of the below options", reply_markup=btn)
 
 
-def character(update: Update, _: CallbackContext):
-    message = update.effective_message
-    search = extract_arg(message)
-    if not search:
-        message.reply_text("Format : /character < character name >")
-        return
-
-    variables = {"query": search}
-    json = requests.post(
-        url,
-        json={"query": character_query, "variables": variables},
-    ).json()
-    if "errors" in json.keys():
-        message.reply_text("Character not found")
-        return
-
-    if json:
-        json = json["data"]["Character"]
-        msg = f"*{json.get('name').get('full')}*(`{json.get('name').get('native')}`)\n"
-        description = f"{json['description']}"
-        site_url = json.get("siteUrl")
-        msg += shorten(description, site_url)
-        if image := json.get("image", None):
-            image = image.get("large")
-            message.reply_photo(
-                photo=image,
-                caption=msg.replace("<b>", "</b>"),
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        else:
-            message.reply_text(
-                msg.replace("<b>", "</b>"),
-                parse_mode=ParseMode.MARKDOWN,
-            )
-
-
-def manga(update: Update, _: CallbackContext):
-    message = update.effective_message
-    search = extract_arg(message)
-
-    if not search:
-        message.reply_text("Format : /manga < manga name >")
-        return
-
-    variables = {"search": search}
-    json = requests.post(
-        url,
-        json={"query": manga_query, "variables": variables},
-    ).json()
-    msg = ""
-    if "errors" in json.keys():
-        message.reply_text("Manga not found")
-        return
-
-    if json:
-        json = json["data"]["Media"]
-        title, title_native = json["title"].get("romaji", False), json["title"].get(
-            "native",
-            False,
-        )
-        start_date, status, score = (
-            json["startDate"].get("year", False),
-            json.get("status", False),
-            json.get("averageScore", False),
-        )
-        if title:
-            msg += f"*{title}*"
-            if title_native:
-                msg += f"(`{title_native}`)"
-        if start_date:
-            msg += f"\n*Start Date* - `{start_date}`"
-        if status:
-            msg += f"\n*Status* - `{status}`"
-        if score:
-            msg += f"\n*Score* - `{score}`"
-        msg += "\n*Genres* - "
-        for x in json.get("genres", []):
-            msg += f"{x}, "
-        msg = msg[:-2]
-        info = json["siteUrl"]
-        buttons = [[InlineKeyboardButton("More Info", url=info)]]
-        image = json.get("bannerImage", False)
-        msg += f"_{json.get('description', None)}_"
-        if image:
-            try:
-                message.reply_photo(
-                    photo=image,
-                    caption=msg,
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=InlineKeyboardMarkup(buttons),
-                )
-            except BaseException:
-                msg += f" [〽️]({image})"
-                message.reply_text(
-                    msg,
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=InlineKeyboardMarkup(buttons),
-                )
-        else:
-            message.reply_text(
-                msg,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=InlineKeyboardMarkup(buttons),
-            )
-
-
-def user(update: Update, _: CallbackContext):
-    message = update.effective_message
-    search_query = extract_arg(message)
-
-    if not search_query:
-        message.reply_text("Format : /user <username>")
-        return
-
-    jikan = jikanpy.jikan.Jikan()
-
-    try:
-        us = jikan.user(search_query)
-    except jikanpy.APIException:
-        message.reply_text("Username not found.")
-        return
-
-    progress_message = message.reply_text("Searching.... ")
-
-    date_format = "%Y-%m-%d"
-    if us["image_url"] is None:
-        img = "https://cdn.myanimelist.net/images/questionmark_50.gif"
+@Client.on_message(filters.private & filters.command("logout", prefixes=trg))
+async def logout_cmd(client, message: Message):
+    if (await AUTH_USERS.find_one({"id": message.from_user.id})):
+        AUTH_USERS.find_one_and_delete({"id": message.from_user.id})
+        await message.reply_text("Logged out!!!")
     else:
-        img = us["image_url"]
+        await message.reply_text("You are not authorized to begin with!!!")
 
+
+@Client.on_message(filters.command(["gettags", f"gettags{BOT_NAME}", "getgenres", f"getgenres{BOT_NAME}"], prefixes=trg))
+async def list_tags_genres_cmd(client, message: Message):
+    find_gc = await DC.find_one({'_id': message.chat.id})
+    if find_gc!=None and "gettags" in message.text.split()[0] and 'gettags' in find_gc['cmd_list'].split():
+        return
+    if find_gc!=None and "getgenres" in message.text.split()[0] and 'getgenres' in find_gc['cmd_list'].split():
+        return
+    if await (SFW_GRPS.find_one({"id": message.chat.id})) and 'nsfw' in message.text:
+        return await message.reply_text('No nsfw allowed here!!!')
+    msg = (await get_all_tags(message.text)) if "gettags" in message.text.split()[0] else (await get_all_genres())
+    await message.reply_text(msg)
+
+
+@Client.on_callback_query(filters.regex(pattern=r"page_(.*)"))
+@check_user
+async def page_btn(client, cq: CallbackQuery):
+    kek, media, query, page, auth, user = cq.data.split("_")
+    if media=="ANIME":
+        try:
+            ANIME_DB[query]
+        except KeyError:
+            return await cq.answer("Query Expired!!!\nCreate new one", show_alert=True)
+    if media=="MANGA":
+        try:
+            MANGA_DB[query]
+        except KeyError:
+            return await cq.answer("Query Expired!!!\nCreate new one", show_alert=True)
+    await cq.answer()
+    get_pg = {"search": query, "page": int(page)}
+    authbool = bool(1) if auth=="True" else bool(0)
+    result = (
+        (await get_anilist(query, int(page), auth=authbool, user=int(user)))
+        if media == "ANIME"
+        else (await get_character(get_pg, auth=authbool, user=int(user)))
+        if media == "CHARACTER"
+        else (await get_manga(query, int(page), auth=authbool, user=int(user)))
+    )
+    pic, msg = result[0], result[1][0]
+    button = get_btns(media, lsqry=query, lspage=int(page), result=result, user=user, auth=authbool)
+    if await (SFW_GRPS.find_one({"id": cq.message.chat.id})) and media!="CHARACTER" and result[2].pop()=="True":
+        button = get_btns(media, lsqry=query, lspage=int(page), result=result, user=user, auth=authbool, sfw="True")
+        await cq.edit_message_media(InputMediaPhoto(no_pic[random.randint(0, 4)], caption="This material is marked 18+ and not allowed in this group"), reply_markup=button)
+        return
+    await cq.edit_message_media(InputMediaPhoto(pic, caption=msg), reply_markup=button)
+
+
+@Client.on_callback_query(filters.regex(pattern=r"btn_(.*)"))
+@check_user
+async def anime_btn(client, cq: CallbackQuery):
+    await cq.answer()
+    query = cq.data.split("_")
+    idm = query[1]
+    user = int(cq.data.split("_").pop())
+    authbool = bool(1) if query[2]=="True" else bool(0)
+    vars_ = {"id": int(idm)}
+    result = await get_anime(vars_, auth=authbool, user=user)
+    pic, msg = result[0], result[1]
+    btns = get_btns("ANIME", result=result, user=user, auth=authbool)
+    await cq.edit_message_media(InputMediaPhoto(pic, caption=msg), reply_markup=btns)
+
+
+@Client.on_callback_query(filters.regex(pattern=r"topanimu_(.*)"))
+@check_user
+async def top_tags_btn(client, cq: CallbackQuery):
+    await cq.answer()
+    kek, gnr, page, user = cq.data.split("_")
+    result = await get_top_animes(gnr, page=page, user=user)
+    msg, buttons = result[0][0], result[1]
+    await cq.edit_message_text(msg, reply_markup=buttons)
+
+
+@Client.on_callback_query(filters.regex(pattern=r"settogl_(.*)"))
+async def nsfw_toggle_btn(client, cq: CallbackQuery):
     try:
-        user_birthday = datetime.datetime.fromisoformat(us["birthday"])
-        user_birthday_formatted = user_birthday.strftime(date_format)
-    except BaseException:
-        user_birthday_formatted = "Unknown"
+        k = await cq.message.chat.get_member(cq.from_user.id)
+    except UserNotParticipant:
+        return
+    if cq.from_user.id not in OWNER and str(k.status)=="member":
+        await cq.answer("You don't have enough permissions to change this!!!", show_alert=True)
+        return
+    await cq.answer()
+    query = cq.data.split("_")
+    if await (SFW_GRPS.find_one({"id": int(query[2])})):
+        sfw = "NSFW: Not Allowed"
+    else:
+        sfw = "NSFW: Allowed"
+    if await (AG.find_one({"_id": int(query[2])})):
+        notif = "Airing notifications: ON"
+    else:
+        notif = "Airing notifications: OFF"
+    if query[1]=="sfw":
+        if await (SFW_GRPS.find_one({"id": int(query[2])})):
+            await SFW_GRPS.find_one_and_delete({"id": int(query[2])})
+            sfw = "NSFW: Allowed"
+        else:
+            await SFW_GRPS.insert_one({"id": int(query[2])})
+            sfw = "NSFW: Not Allowed"
+    if query[1]=="notif":
+        if await (AG.find_one({"_id": int(query[2])})):
+            await AG.find_one_and_delete({"_id": int(query[2])})
+            notif = "Airing notifications: OFF"
+        else:
+            await AG.insert_one({"_id": int(query[2])})
+            notif = "Airing notifications: ON"
+    btns = InlineKeyboardMarkup([
+        [InlineKeyboardButton(text=sfw, callback_data=f"settogl_sfw_{query[2]}")],
+        [InlineKeyboardButton(text=notif, callback_data=f"settogl_notif_{query[2]}")]
+    ])
+    await cq.edit_message_reply_markup(reply_markup=btns)
 
-    user_joined_date = datetime.datetime.fromisoformat(us["joined"])
-    user_joined_date_formatted = user_joined_date.strftime(date_format)
 
-    for entity in us:
-        if us[entity] is None:
-            us[entity] = "Unknown"
+@Client.on_callback_query(filters.regex(pattern=r"myacc_(.*)"))
+@check_user
+async def flex_btn(client, cq: CallbackQuery):
+    await cq.answer()
+    query = cq.data.split("_")[1]
+    user = cq.data.split("_").pop()
+    result = await get_user_activity(int(query), user=int(user))
+    pic, msg, btns = result
+    await cq.edit_message_media(InputMediaPhoto(pic, caption=msg), reply_markup=btns)
 
-    about = us["about"].split(" ", 60)
 
-    with contextlib.suppress(IndexError):
-        about.pop(60)
-    about_string = " ".join(about)
-    about_string = about_string.replace("<br>", "").strip().replace("\r\n", "\n")
-
-    caption = ""
-
-    caption += textwrap.dedent(
-        f"""
-    *Username*: [{us['username']}]({us['url']})
-
-    *Gender*: `{us['gender']}`
-    *Birthday*: `{user_birthday_formatted}`
-    *Joined*: `{user_joined_date_formatted}`
-    *Days wasted watching anime*: `{us['anime_stats']['days_watched']}`
-    *Days wasted reading manga*: `{us['manga_stats']['days_read']}`
-
-    """,
+@Client.on_callback_query(filters.regex(pattern=r"myfavs_(.*)"))
+@check_user
+async def list_favourites_btn(client, cq: CallbackQuery):
+    await cq.answer()
+    q = cq.data.split("_")
+    btn = [[
+        InlineKeyboardButton("ANIME", callback_data=f"myfavqry_ANIME_{q[1]}_1_{q[2]}_{q[3]}"),
+        InlineKeyboardButton("CHARACTER", callback_data=f"myfavqry_CHAR_{q[1]}_1_{q[2]}_{q[3]}"),
+        InlineKeyboardButton("MANGA", callback_data=f"myfavqry_MANGA_{q[1]}_1_{q[2]}_{q[3]}")
+    ]]
+    if q[2] == "yes":
+        btn.append([InlineKeyboardButton("Back", callback_data=f"getusrbc_{q[3]}")])
+    else:
+        btn.append([InlineKeyboardButton("Profile", url=f"https://anilist.co/user/{q[1]}")])
+    await cq.edit_message_media(
+        InputMediaPhoto(f"https://img.anili.st/user/{q[1]}?a={time.time()}", caption="Choose one of the below options"),
+        reply_markup=InlineKeyboardMarkup(btn)
     )
 
-    caption += f"*About*: {about_string}"
 
-    buttons = [
-        [InlineKeyboardButton(info_btn, url=us["url"])],
-        [
+@Client.on_callback_query(filters.regex(pattern=r"myfavqry_(.*)"))
+@check_user
+async def favourites_btn(client, cq: CallbackQuery):
+    await cq.answer()
+    q = cq.data.split("_")
+    pic, msg, btns = await get_user_favourites(q[2], int(q[5]), q[1], q[3], q[4])
+    await cq.edit_message_media(InputMediaPhoto(pic, caption=msg), reply_markup=btns)
+
+
+@Client.on_callback_query(filters.regex(pattern=r"getusrbc_(.*)"))
+@check_user
+async def get_user_back_btn(client, cq: CallbackQuery):
+    await cq.answer()
+    query = cq.data.split("_")[1]
+    result = await get_user(None, "flex", user=int(query))
+    pic, msg, btns = result
+    await cq.edit_message_media(InputMediaPhoto(pic, caption=msg), reply_markup=btns)
+
+
+@Client.on_callback_query(filters.regex(pattern=r"fav_(.*)"))
+@check_user
+async def toggle_favourites_btn(client, cq: CallbackQuery):
+    query = cq.data.split("_")
+    if query[1]=="ANIME" and len(query)>4:
+        try:
+            ANIME_DB[query[3]]
+        except KeyError:
+            return await cq.answer("Query Expired!!!\nCreate new one", show_alert=True)
+    if query[1]=="MANGA":
+        try:
+            MANGA_DB[query[3]]
+        except KeyError:
+            return await cq.answer("Query Expired!!!\nCreate new one", show_alert=True)
+    idm = int(query[2])
+    user = int(cq.data.split("_").pop())
+    rslt = await toggle_favourites(id_=idm, media=query[1], user=user)
+    if rslt=="ok":
+        await cq.answer("Updated")
+    else:
+        return
+    result = (
+        (await get_anime({"id": idm}, auth=True, user=user)) if query[1]=="ANIME" and len(query)==4
+        else (await get_anilist(query[3], page = int(query[4]), auth=True, user=user)) if query[1]=="ANIME" and len(query)!=4
+        else (await get_manga(query[3], page = int(query[4]), auth=True, user=user)) if query[1]=="MANGA"
+        else (await get_airing({"id": idm}, auth=True, user=user)) if query[1]=="AIRING"
+        else (await get_character({"search": query[3], "page": int(query[4])}, auth=True, user=user))
+    )
+    pic, msg = (
+        (result[0], result[1]) if query[1]=="ANIME" and len(query)==4
+        else (result[0]) if query[1]=="AIRING"
+        else (result[0], result[1][0])
+    )
+    btns = get_btns(
+        query[1],
+        result=result,
+        user=user,
+        auth=True,
+        lsqry=query[3] if len(query)!=4 else None,
+        lspage=int(query[4]) if len(query)!=4 else None
+    )
+    await cq.edit_message_media(InputMediaPhoto(pic, caption=msg), reply_markup=btns)
+
+
+@Client.on_callback_query(filters.regex(pattern=r"(lsadd|lsupdt)_(.*)"))
+@check_user
+async def list_update_anilist_btn(client, cq: CallbackQuery):
+    stts_ls = ["COMPLETED", "CURRENT", "PLANNING", "DROPPED", "PAUSED", "REPEATING"]
+    query = cq.data.split("_")
+    btns = []
+    row = []
+    for i in stts_ls:
+        row.append(
             InlineKeyboardButton(
-                close_btn,
-                callback_data=f"anime_close, {message.from_user.id}",
-            ),
-        ],
-    ]
+                text=i,
+                callback_data=cq.data.replace("lsadd", f"lsas_{i}") if query[0]=="lsadd" else cq.data.replace("lsupdt", f"lsus_{i}")
+            )
+        )
+        if len(row)==3:
+            btns.append(row)
+            row = []
+    if query[0]=="lsupdt":
+        btns.append([InlineKeyboardButton("Delete", callback_data=cq.data.replace("lsupdt", f"dlt_{i}"))])
+    await cq.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(btns))
 
-    message.reply_photo(
-        photo=img,
-        caption=caption,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup(buttons),
+
+@Client.on_callback_query(filters.regex(pattern=r"(lsas|lsus|dlt)_(.*)"))
+@check_user
+async def update_anilist_btn(client, cq: CallbackQuery):
+    query = cq.data.split("_")
+    if query[2]=="ANIME":
+        if len(query)==7:
+            try:
+                ANIME_DB[query[4]]
+            except KeyError:
+                return await cq.answer("Query Expired!!!\nCreate new one", show_alert=True)
+        if len(query)==8:
+            try:
+                ANIME_DB[query[5]]
+            except KeyError:
+                return await cq.answer("Query Expired!!!\nCreate new one", show_alert=True)
+    if query[2]=="MANGA":
+        if len(query)==7:
+            try:
+                MANGA_DB[query[4]]
+            except KeyError:
+                return await cq.answer("Query Expired!!!\nCreate new one", show_alert=True)
+        if len(query)==8:
+            try:
+                MANGA_DB[query[5]]
+            except KeyError:
+                return await cq.answer("Query Expired!!!\nCreate new one", show_alert=True)
+    idm = int(query[3])
+    user = int(cq.data.split("_").pop())
+    eid = None
+    if query[0]!="lsas":
+        eid = int(query[4])
+    rslt = await update_anilist(id=idm, req=query[0], status=query[1], user=user, eid=eid)
+    if rslt=="ok":
+        await cq.answer("Updated")
+    else:
+        return
+    result = (
+        (await get_anime({"id": idm}, auth=True, user=user)) if query[2]=="ANIME" and (len(query)==5 or len(query)==6)
+        else (await get_anilist(query[4], page = int(query[5]), auth=True, user=user)) if query[2]=="ANIME" and len(query)==7
+        else (await get_anilist(query[5], page = int(query[6]), auth=True, user=user)) if query[2]=="ANIME" and len(query)==8
+        else (await get_manga(query[4], page = int(query[5]), auth=True, user=user)) if query[2]=="MANGA" and len(query)==7
+        else (await get_manga(query[5], page = int(query[6]), auth=True, user=user)) if query[2]=="MANGA" and len(query)==8
+        else (await get_airing({"id": idm}, auth=True, user=user))
     )
-    progress_message.delete()
+    pic, msg = (
+        (result[0], result[1]) if query[2]=="ANIME" and len(query)==5 or len(query)==6
+        else (result[0]) if query[2]=="AIRING"
+        else (result[0], result[1][0])
+    )
+    btns = get_btns(
+        query[2],
+        result=result,
+        user=user,
+        auth=True,
+        lsqry=query[4] if len(query)==7 else query[5] if len(query)==8 else None,
+        lspage=int(query[5]) if len(query)==7 else int(query[6]) if len(query)==8 else None
+    )
+    await cq.edit_message_media(InputMediaPhoto(pic, caption=msg), reply_markup=btns)
 
 
-def upcoming(update: Update, _: CallbackContext):
-    jikan = jikanpy.jikan.Jikan()
-    upcomin = jikan.top("anime", page=1, subtype="upcoming")
+@Client.on_callback_query(filters.regex(pattern=r"(desc|ls|char)_(.*)"))
+@check_user
+async def additional_info_btn(client: Client, cq: CallbackQuery):
+    await cq.answer()
+    q = cq.data.split("_")
+    kek, query, ctgry = q[0], q[1], q[2]
+    info = (
+        "<b>Description</b>"
+        if kek == "desc"
+        else "<b>Series List</b>"
+        if kek == "ls"
+        else "<b>Characters List</b>"
+    )
+    lsqry = f"_{q[3]}" if len(q) > 4 else ""
+    lspg = f"_{q[4]}" if len(q) > 4 else ""
+    pic, result = await get_additional_info(query, kek, ctgry)
+    button = []
+    spoiler = False
+    bot = (await client.get_me()).username
+    if "~!" in result and "!~" in result:
+        result = re.sub(r"~!.*!~", "[Spoiler]", result)
+        spoiler = True
+        button.append([InlineKeyboardButton(text="View spoiler", url=f"https://t.me/{bot}/?start=des_{ctgry}_{query}")])
+    if len(result) > 1000:
+        result = result[:940] + "..."
+        if spoiler==False:
+            result += "\n\nFor more info click below given button"
+            button.append([InlineKeyboardButton(text="More Info", url=f"https://t.me/{bot}/?start=des_{ctgry}_{query}")])
+    msg = f"{info}:\n\n{result}"
+    user = cq.data.split("_").pop()
+    cbd = (
+        f"btn_{query}_{q[3]}_{user}" if len(q) == 5
+        else f"page_ANIME{lsqry}{lspg}_{q[5]}_{user}" if ctgry=="ANI"
+        else f"page_CHARACTER{lsqry}{lspg}_{q[5]}_{user}"
+    )
+    button.append([InlineKeyboardButton(text="Back", callback_data=cbd)])
+    await cq.edit_message_media(InputMediaPhoto(pic, caption=msg), reply_markup=InlineKeyboardMarkup(button))
 
-    upcoming_list = [entry["title"] for entry in upcomin["top"]]
-    upcoming_message = ""
 
-    for entry_num, _ in enumerate(upcoming_list):
-        if entry_num == 10:
-            break
-        upcoming_message += f"{entry_num + 1}. {upcoming_list[entry_num]}\n"
+@Client.on_callback_query(filters.regex(pattern=r"lsc_(.*)"))
+@check_user
+async def featured_in_btn(client, cq: CallbackQuery):
+    kek, idm, qry, pg, auth, user = cq.data.split("_")
+    result = await get_featured_in_lists(int(idm), "ANI")
+    req = "lscm"
+    if result[0]==False:
+        result = await get_featured_in_lists(int(idm), "MAN")
+        req = None
+        if result[0]==False:
+            await cq.answer("No Data Available!!!")
+            return
+    [msg, total], pic = result
+    button = []
+    totalpg, kek = divmod(total, 15)
+    if kek!=0:
+        totalpg + 1
+    if total>15:
+        button.append([InlineKeyboardButton(text="Next", callback_data=f"lsca_{idm}_1_{qry}_{pg}_{auth}_{user}")])
+    if req!=None:
+        button.append([InlineKeyboardButton(text="Manga", callback_data=f"lscm_{idm}_0_{qry}_{pg}_{auth}_{user}")])
+    button.append([InlineKeyboardButton(text="Back", callback_data=f"page_CHARACTER_{qry}_{pg}_{auth}_{user}")])
+    await cq.edit_message_media(InputMediaPhoto(pic, caption=msg), reply_markup=InlineKeyboardMarkup(button))
 
-    update.effective_message.reply_text(upcoming_message)
 
-
-__help__ = """
-Get information about anime, manga or characters from [AniList](anilist.co).
-
-*Available commands:*
-
-× /anime `<anime>`: returns information about the anime.
-× /character `<character>`: returns information about the character.
-× /manga `<manga>`: returns information about the manga.
-× /user `<user>`: returns information about a MyAnimeList user.
-× /upcoming: returns a list of new anime in the upcoming seasons.
-× /airing `<anime>`: returns anime airing info.
-"""
-
-ANIME_HANDLER = DisableAbleCommandHandler("anime", anime, run_async=True)
-AIRING_HANDLER = DisableAbleCommandHandler("airing", airing, run_async=True)
-CHARACTER_HANDLER = DisableAbleCommandHandler("character", character, run_async=True)
-MANGA_HANDLER = DisableAbleCommandHandler("manga", manga, run_async=True)
-USER_HANDLER = DisableAbleCommandHandler("user", user, run_async=True)
-UPCOMING_HANDLER = DisableAbleCommandHandler("upcoming", upcoming, run_async=True)
-
-dispatcher.add_handler(ANIME_HANDLER)
-dispatcher.add_handler(CHARACTER_HANDLER)
-dispatcher.add_handler(MANGA_HANDLER)
-dispatcher.add_handler(AIRING_HANDLER)
-dispatcher.add_handler(USER_HANDLER)
-dispatcher.add_handler(UPCOMING_HANDLER)
-
-__mod_name__ = "Anime"
+@Client.on_callback_query(filters.regex(pattern=r"lsc(a|m)_(.*)"))
+@check_user
+async def featured_in_switch_btn(client, cq: CallbackQuery):
+    req, idm, reqpg, qry, pg, auth, user = cq.data.split("_")
+    result = await get_featured_in_lists(int(idm), "MAN" if req=="lscm" else "ANI", page=int(reqpg))
+    reqb = "lsca" if req=="lscm" else "lscm"
+    bt = "Anime"  if req=="lscm" else "Manga"
+    if result[0]==False:
+        await cq.answer("No Data Available!!!")
+        return
+    [msg, total], pic = result
+    totalpg, kek = divmod(total, 15)
+    if kek!=0:
+        totalpg + 1
+    button = []
+    if total>15:
+        if int(reqpg)==0:
+            button.append([InlineKeyboardButton(text="Next", callback_data=f"{req}_{idm}_{int(reqpg)+1}_{qry}_{pg}_{auth}_{user}")])
+        elif int(reqpg)==totalpg:
+            button.append([InlineKeyboardButton(text="Back", callback_data=f"{req}_{idm}_{int(reqpg)-1}_{qry}_{pg}_{auth}_{user}")])
+        else:
+            button.append(
+                [
+                    InlineKeyboardButton(text="Back", callback_data=f"{req}_{idm}_{int(reqpg)-1}_{qry}_{pg}_{auth}_{user}"),
+                    InlineKeyboardButton(text="Next", callback_data=f"{req}_{idm}_{int(reqpg)+1}_{qry}_{pg}_{auth}_{user}")
+                ]
+            )
+    button.append([InlineKeyboardButton(text=f"{bt}", callback_data=f"{reqb}_{idm}_0_{qry}_{pg}_{auth}_{user}")])
+    button.append([InlineKeyboardButton(text="Back", callback_data=f"page_CHARACTER_{qry}_{pg}_{auth}_{user}")])
+    await cq.edit_message_media(InputMediaPhoto(pic, caption=msg), reply_markup=InlineKeyboardMarkup(button))
