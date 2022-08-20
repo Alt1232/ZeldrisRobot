@@ -281,6 +281,6 @@ DOWN_PATH = "zeldris/downloads/"
 HELP_DICT = dict()
 
 session = ClientSession()
-plugins = dict(root="zeldris/plugins")
+plugins = dict(root="zeldris/modules")
 anibot = Client("zeldris", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, plugins=plugins)
 
