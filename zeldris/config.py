@@ -36,7 +36,7 @@ class Config(object):
 
     URL = None
 
-    MONGO_URI = "mongodb://Itachi:vMl3AGWVUcHh0enN@cluster0-shard-00-00.ydoa8.mongodb.net:27017,cluster0-shard-00-01.ydoa8.mongodb.net:27017,cluster0-shard-00-02.ydoa8.mongodb.net:27017/myFirstDatabase?ssl=true&replicaSet=atlas-133a3e-shard-0&authSource=admin&retryWrites=true&w=majority"
+    MONGO_URI = "mongodb://Itachi:vMl3AGWVUcHh0enN@cluster0-shard-00-00.ydoa8.mongodb.net:27017,cluster0-shard-00-01.ydoa8.mongodb.net:27017,cluster0-shard-00-02.ydoa8.mongodb.net:27017/myFirstDatabase?ssl=true&replicaSet=atlas-133a3e-shard-0&authSource=admin&retryWrites=true"
 
     MONGO_PORT = 27017  # leave it as it is
 
