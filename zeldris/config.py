@@ -36,7 +36,8 @@ class Config(object):
 
     URL = None
 
-    MONGO_URI = "mongodb+srv://Rqveriie:itachi@cluster0.1xpmofm.mongodb.net/?retryWrites=true&w=majority"
+    MONGO_URI = "mongodb+srv://Rqveriie:<
+itachi@cluster0.1xpmofm.mongodb.net/?retryWrites=true&w=majority"
 
     MONGO_PORT = 27017  # leave it as it is
 
