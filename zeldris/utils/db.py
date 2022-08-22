@@ -11,7 +11,7 @@ from .. import DBS_URL
 
 print("Connecting to Database ...")
 
-_MGCLIENT: AgnosticClient = AsyncIOMotorClient(DB_URL)
+_MGCLIENT: AgnosticClient = AsyncIOMotorClient(DBS_URL)
 _RUN = asyncio.get_event_loop().run_until_complete
 
 if "anibot" in _RUN(_MGCLIENT.list_database_names()):
